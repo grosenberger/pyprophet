@@ -241,11 +241,21 @@ def postprocess_uis_tables(pathes, uis_res_pathes):
     uis_scored_table = uis_scored_table[uis_scored_table['decoy'] == 0]
     uis_scored_table['peptidoforms'] = uis_scored_table['transition_group_id'].str.extract("\{(.*?)\}")
 
-    # precursor-level inference
-    logging.info("start precursor-level inference")
-    uis_precursor_data = precursor_inference(uis_scored_table)
-    uis_precursor_data = uis_precursor_data[(uis_precursor_data['prec_pg_score'] >= CONFIG.get("uis_scoring.prec_pg_id_probability"))]
-    logging.info("end precursor-level inference")
+    # skip / overwrite precursor-level inference
+    if CONFIG.get("uis_scoring.disable_precursor_inference"):
+        logging.info("start skipping precursor-level inference and conduct estimation of FLR/flr only")
+        uis_scored_table['ms1_pg_score'] = 1
+        uis_scored_table['ms2_pg_score'] = 1
+        uis_scored_table[uis_scored_table['annotation'] == "Precursor_i0"]['pg_score'] = 1
+        uis_precursor_data = precursor_inference(uis_scored_table)
+        uis_precursor_data = uis_precursor_data[(uis_precursor_data['prec_pg_score'] >= CONFIG.get("uis_scoring.prec_pg_id_probability"))]
+        logging.info("end skipping precursor-level inference and conduct estimation of FLR/flr only")
+    else:
+        # precursor-level inference
+        logging.info("start precursor-level inference")
+        uis_precursor_data = precursor_inference(uis_scored_table)
+        uis_precursor_data = uis_precursor_data[(uis_precursor_data['prec_pg_score'] >= CONFIG.get("uis_scoring.prec_pg_id_probability"))]
+        logging.info("end precursor-level inference")
 
     # start posterior peptidoform-level inference
     logging.info("start peptidoform-level inference")

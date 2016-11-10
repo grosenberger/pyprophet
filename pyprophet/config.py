@@ -112,6 +112,9 @@ def _standard_config(n_cpus=1):
     config["uis_scoring.disable_h0"] = False
     info["uis_scoring.disable_h0"] = """[disable inclusion of null hypothesis (all peptidoforms are wrong)]"""
 
+    config["uis_scoring.disable_precursor_inference"] = False
+    info["uis_scoring.disable_precursor_inference"] = """[disable inference of precursors and conduct estimation of FLR / flr only]"""
+
     config["uis_scoring.isotope_overlap_threshold"] = 0.5
     info["uis_scoring.isotope_overlap_threshold"] = """[set maximum isotope overlap threshold for identification transitions]"""
 
