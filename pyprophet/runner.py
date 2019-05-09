@@ -170,10 +170,10 @@ ORDER BY RUN_ID,
             # Mark main score column
             if ss_main_score.lower() in table.columns:
                 table = table.rename(index=str, columns={ss_main_score.lower(): "main_"+ss_main_score.lower()})
-            elif ss_main_score.lower() == "swath_pretrained":
+            elif ss_main_score.lower() == "nanolc_qtof":
                 # Add a pretrained main score corresponding to the original implementation in OpenSWATH
-                # This is optimized for 32-windows SCIEX TripleTOF 5600 data
-                table['main_var_pretrained'] = -( -0.19011762 * table['var_library_corr']
+                # This is optimized for nanoLC 32-windows SCIEX TripleTOF data
+                table['main_var_nanolc_qtof'] = -( -0.19011762 * table['var_library_corr']
                                                 +  2.47298914 * table['var_library_rmsd']
                                                 +  5.63906731 * table['var_norm_rt_score']
                                                 + -0.62640133 * table['var_isotope_correlation_score']
@@ -183,6 +183,17 @@ ORDER BY RUN_ID,
                                                 + -1.16475032 * table['var_xcorr_shape']
                                                 + -0.19267813 * table['var_yseries_score']
                                                 + -0.61712054 * table['var_log_sn_score'])
+            elif ss_main_score.lower() == "evosep_qtof":
+                # Add a pretrained main score
+                # This is optimized for EvoSep 64-windows SCIEX TripleTOF data
+                table['main_var_evosep_qtof'] = -( 3.49093678 * table['var_dotprod_score']
+                                                +  2.08044816 * table['var_isotope_correlation_score']
+                                                + -1.72838094 * table['var_library_sangle']
+                                                +  0.30851031 * table['var_log_sn_score']
+                                                + -0.10715520 * table['var_massdev_score_weighted']
+                                                + -4.92353700 * table['var_norm_rt_score']
+                                                + -0.31482196 * table['var_xcorr_coelution_weighted']
+                                                +  1.96546353 * table['var_xcorr_shape_weighted'])
             else:
                 raise click.ClickException("Main score column not present in data.")
 
