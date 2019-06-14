@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import sqlite3
 
+from scipy.stats import rankdata
 from .stats import error_statistics, lookup_values_from_error_table, final_err_table, summary_err_table
 from .report import save_report
 from shutil import copyfile
@@ -197,6 +198,174 @@ ORDER BY SCORE DESC
     con.close()
 
 
+def infer_inter(infile, outfile, parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps):
+
+    def rank_rt(x):
+        y = x['delta_rt'].values
+        center = np.argmin(np.abs(y))
+        ranks = rankdata(y, method='ordinal')
+
+        x['rank_rt'] = ranks - ranks[center]
+
+        return(x[['feature_id','rank_rt']])
+
+    con = sqlite3.connect(infile)
+
+    if not check_sqlite_table(con, "SCORE_MS2"):
+        raise click.ClickException("Apply scoring to MS2-level data before running peptide-level scoring.")
+
+    con.executescript('''
+CREATE INDEX IF NOT EXISTS idx_peptide_peptide_id ON PEPTIDE (ID);
+CREATE INDEX IF NOT EXISTS idx_precursor_peptide_mapping_peptide_id ON PRECURSOR_PEPTIDE_MAPPING (PEPTIDE_ID);
+CREATE INDEX IF NOT EXISTS idx_precursor_peptide_mapping_precursor_id ON PRECURSOR_PEPTIDE_MAPPING (PRECURSOR_ID);
+CREATE INDEX IF NOT EXISTS idx_precursor_precursor_id ON PRECURSOR (ID);
+CREATE INDEX IF NOT EXISTS idx_feature_precursor_id ON FEATURE (PRECURSOR_ID);
+CREATE INDEX IF NOT EXISTS idx_feature_feature_id ON FEATURE (ID);
+CREATE INDEX IF NOT EXISTS idx_score_ms2_feature_id ON SCORE_MS2 (FEATURE_ID);
+''')
+
+    data = pd.read_sql_query('''
+SELECT RUN_ID AS RUN_ID,
+   PRECURSOR.ID AS PRECURSOR_ID,
+   FEATURE.ID AS FEATURE_ID,
+   PEPTIDE.ID AS PEPTIDE_ID,
+   FEATURE.DELTA_RT AS DELTA_RT,
+   PEPTIDE.UNMODIFIED_SEQUENCE AS UNMODIFIED_SEQUENCE,
+   PRECURSOR.DECOY,
+   PEP
+FROM PEPTIDE
+INNER JOIN PRECURSOR_PEPTIDE_MAPPING ON PEPTIDE.ID = PRECURSOR_PEPTIDE_MAPPING.PEPTIDE_ID
+INNER JOIN PRECURSOR ON PRECURSOR_PEPTIDE_MAPPING.PRECURSOR_ID = PRECURSOR.ID
+INNER JOIN FEATURE ON PRECURSOR.ID = FEATURE.PRECURSOR_ID
+INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
+WHERE SCORE_MS2.RANK == 1
+ORDER BY SCORE DESC
+''', con)
+
+    data.columns = [col.lower() for col in data.columns]
+    con.close()
+
+    # Compute inter-experiment alignment scores
+    click.echo("Info: Compute Inter-Experiment Alignment (IEA) scores.")
+
+    # Rank peak groups according expected retention time
+    iea_ranked = data.copy()
+    iea_ranked['delta_rt_abs'] = iea_ranked['delta_rt'].abs()
+    iea_ranked['iearank'] = iea_ranked.groupby(['run_id','precursor_id'])['delta_rt'].rank(method='first').astype(int)
+
+    iea_center = iea_ranked.loc[iea_ranked.groupby(['run_id','precursor_id'])['delta_rt_abs'].idxmin()][['run_id','precursor_id','iearank']]
+    iea_center.columns = ['run_id','precursor_id','ieacenter']
+
+    iea = iea_ranked.merge(iea_center, on=['run_id','precursor_id'])
+    iea['rank_rt'] = iea['iearank'] - iea['ieacenter']
+
+    # Compute IEA sum per precursor_id & rank_rt
+    ieasum = iea.groupby(['precursor_id','rank_rt'])['pep'].apply(lambda x: sum((1-x)-0.5)).reset_index(name='ieasum')
+    iea = iea.merge(ieasum, on=['precursor_id','rank_rt'])
+
+    # Compute IEA score per peak group
+    iea['iea'] = iea.apply(lambda x: x['ieasum']-((1-x['pep'])-0.5), axis=1)
+
+    iea.loc[iea['iea'] > 15]['iea'] = 15
+    iea.loc[iea['iea'] < -15]['iea'] = -15
+
+    # Compute posterior error probabilities from IEA scores
+    iea_error_stat, iea_pi0 = error_statistics(iea[iea.decoy==0]['iea'], iea[iea.decoy==1]['iea'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
+    iea_p_values, _, iea_peps, _ = lookup_values_from_error_table(iea["iea"].values, iea_error_stat)
+    iea_stat_table = final_err_table(iea_error_stat)
+
+    iea["iea_p_value"] = iea_p_values
+    iea["iea_pep"] = iea_peps
+
+    # export IEA PDF report
+    save_report(outfile + "_" + "inter_iea" + ".pdf", outfile + ": " + "IEA-level error-rate control", iea[iea.decoy==1]["iea"], iea[iea.decoy==0]["iea"], iea_stat_table["cutoff"], iea_stat_table["svalue"], iea_stat_table["qvalue"], iea[iea.decoy==0]["iea_p_value"], iea_pi0)
+
+    # Reduce IEA scores
+    iea = iea[['feature_id','iea_pep']]
+
+    # Compute sibling ion scores
+    click.echo("Info: Compute Number of Sibling Ion (NSI) scores.")
+
+    nsisum = data.groupby(['run_id','peptide_id'])['pep'].apply(lambda x: sum(1.0-x)).reset_index(name='nsisum')
+
+    nsi = data.merge(nsisum, on=['run_id','peptide_id'])
+    nsi['nsi'] = nsi['nsisum'] - (1.0-nsi['pep'])
+
+    # Compute posterior error probabilities from NSI scores
+    nsi_error_stat, nsi_pi0 = error_statistics(nsi[nsi.decoy==0]['nsi'], nsi[nsi.decoy==1]['nsi'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
+    nsi_p_values, _, nsi_peps, _ = lookup_values_from_error_table(nsi["nsi"].values, nsi_error_stat)
+    nsi_stat_table = final_err_table(nsi_error_stat)
+
+    nsi["nsi_p_value"] = nsi_p_values
+    nsi["nsi_pep"] = nsi_peps
+
+    # export NSI PDF report
+    save_report(outfile + "_" + "inter_nsi" + ".pdf", outfile + ": " + "NSI-level error-rate control", nsi[nsi.decoy==1]["nsi"], nsi[nsi.decoy==0]["nsi"], nsi_stat_table["cutoff"], nsi_stat_table["svalue"], nsi_stat_table["qvalue"], nsi[nsi.decoy==0]["nsi_p_value"], nsi_pi0)
+
+    # Reduce NSI scores
+    nsi = nsi[['feature_id','nsi_pep']]
+
+    # Compute sibling modifications scores
+    click.echo("Info: Compute Number of Sibling Modifications (NSM) scores.")
+
+    nsmsum = data.groupby(['run_id','unmodified_sequence'])['pep'].apply(lambda x: sum(1.0-x)).reset_index(name='nsmsum')
+
+    nsm = data.merge(nsmsum, on=['run_id','unmodified_sequence'])
+    nsm['nsm'] = nsm['nsmsum'] - (1.0-nsm['pep'])
+
+    # Compute posterior error probabilities from NSM scores
+    nsm_error_stat, nsm_pi0 = error_statistics(nsm[nsm.decoy==0]['nsm'], nsm[nsm.decoy==1]['nsm'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
+    nsm_p_values, _, nsm_peps, _ = lookup_values_from_error_table(nsm["nsm"].values, nsm_error_stat)
+    nsm_stat_table = final_err_table(nsm_error_stat)
+
+    nsm["nsm_p_value"] = nsm_p_values
+    nsm["nsm_pep"] = nsm_peps
+
+    # export NSM PDF report
+    save_report(outfile + "_" + "inter_nsm" + ".pdf", outfile + ": " + "NSM-level error-rate control", nsm[nsm.decoy==1]["nsm"], nsm[nsm.decoy==0]["nsm"], nsm_stat_table["cutoff"], nsm_stat_table["svalue"], nsm_stat_table["qvalue"], nsm[nsm.decoy==0]["nsm_p_value"], nsm_pi0)
+
+    # Reduce NSM scores
+    nsm = nsm[['feature_id','nsm_pep']]
+
+    # Compute inter analyte & experiment probabilities
+    click.echo("Info: Compute inter analyte & experiment probabilities.")
+    inter = data.merge(iea, on='feature_id').merge(nsi, on='feature_id').merge(nsm, on='feature_id')
+
+    # Bayesian integration
+    inter['inter'] = (((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) / ((((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) + ((inter['iea_pep']*inter['nsi_pep']*inter['nsm_pep']) * inter['pep']))
+
+    # Compute posterior error probabilities from inter scores
+    inter_error_stat, inter_pi0 = error_statistics(inter[inter.decoy==0]['inter'], inter[inter.decoy==1]['inter'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
+    inter_p_values, _, inter_peps, inter_q_values = lookup_values_from_error_table(inter["inter"].values, inter_error_stat)
+    inter_stat_table = final_err_table(inter_error_stat)
+    inter_summary_table = summary_err_table(inter_error_stat)
+
+    inter["inter_p_value"] = inter_p_values
+    inter["inter_pep"] = inter_peps
+    inter["inter_q_value"] = inter_q_values
+
+    # print summary table
+    click.echo("=" * 80)
+    click.echo(inter_summary_table)
+    click.echo("=" * 80)
+
+    # export inter PDF report
+    save_report(outfile + "_" + "inter_integrated" + ".pdf", outfile + ": " + "inter-level error-rate control", inter[inter.decoy==1]["inter"], inter[inter.decoy==0]["inter"], inter_stat_table["cutoff"], inter_stat_table["svalue"], inter_stat_table["qvalue"], inter[inter.decoy==0]["inter_p_value"], inter_pi0)
+
+    # store data in table
+    if infile != outfile:
+        copyfile(infile, outfile)
+    
+    con = sqlite3.connect(outfile)
+
+    df = inter[['feature_id','inter_p_value','inter_q_value','inter_pep']]
+    df.columns = ['FEATURE_ID','PVALUE','QVALUE','PEP']
+    table = "SCORE_INTER"
+    df.to_sql(table, con, index=False, dtype={"FEATURE_ID": "INTEGER"}, if_exists='replace')
+
+    con.close()
+
+
 def subsample_osw(infile, outfile, subsample_ratio, test):
     conn = sqlite3.connect(infile)
     ms1_present = check_sqlite_table(conn, "FEATURE_MS1")
@@ -372,22 +541,26 @@ INSERT INTO RUN
 SELECT *
 FROM sdb.RUN;
 
-CREATE TABLE SCORE_MS2(FEATURE_ID INTEGER, SCORE REAL);
+CREATE TABLE SCORE_MS2(FEATURE_ID INTEGER, SCORE REAL, RANK INTEGER, PEP REAL);
 
-INSERT INTO SCORE_MS2 (FEATURE_ID, SCORE)
+INSERT INTO SCORE_MS2 (FEATURE_ID, SCORE, RANK, PEP)
 SELECT FEATURE_ID,
-       SCORE
+       SCORE,
+       RANK,
+       PEP
 FROM sdb.SCORE_MS2
 WHERE RANK == 1;
 
 CREATE TABLE FEATURE(ID INT PRIMARY KEY NOT NULL,
                      RUN_ID INT NOT NULL,
-                     PRECURSOR_ID INT NOT NULL);
+                     PRECURSOR_ID INT NOT NULL,
+                     DELTA_RT REAL);
 
-INSERT INTO FEATURE (ID, RUN_ID, PRECURSOR_ID)
+INSERT INTO FEATURE (ID, RUN_ID, PRECURSOR_ID, DELTA_RT)
 SELECT ID,
        RUN_ID,
-       PRECURSOR_ID
+       PRECURSOR_ID,
+       DELTA_RT
 FROM sdb.FEATURE
 WHERE ID IN
     (SELECT FEATURE_ID
@@ -576,11 +749,12 @@ DROP TABLE IF EXISTS SCORE_IPF;
 CREATE TABLE RUN(ID INT PRIMARY KEY NOT NULL,
                  FILENAME TEXT NOT NULL);
 
-CREATE TABLE SCORE_MS2(FEATURE_ID INTEGER, SCORE REAL);
+CREATE TABLE SCORE_MS2(FEATURE_ID INTEGER, SCORE REAL, RANK INTEGER, PEP REAL);
 
 CREATE TABLE FEATURE(ID INT PRIMARY KEY NOT NULL,
                      RUN_ID INT NOT NULL,
-                     PRECURSOR_ID INT NOT NULL);
+                     PRECURSOR_ID INT NOT NULL,
+                     DELTA_RT DOUBLE NOT NULL);
 ''')
 
     for infile in infiles:
@@ -617,19 +791,23 @@ def backpropagate_oswr(infile, outfile, apply_scores):
 
     # find out what tables exist in the scores
     score_con = sqlite3.connect(apply_scores)
+    inter_present = check_sqlite_table(score_con, "SCORE_INTER")
     peptide_present = check_sqlite_table(score_con, "SCORE_PEPTIDE")
     protein_present = check_sqlite_table(score_con, "SCORE_PROTEIN")
     score_con.close()
-    if not (peptide_present or protein_present):
-        raise click.ClickException('Backpropagation requires peptide or protein-level contexts.')
+    if not (inter_present or peptide_present or protein_present):
+        raise click.ClickException('Backpropagation requires inter, peptide or protein-level contexts.')
 
     # build up the list
     script = list()
     script.append('PRAGMA synchronous = OFF;')
+    script.append('DROP TABLE IF EXISTS SCORE_INTER;')
     script.append('DROP TABLE IF EXISTS SCORE_PEPTIDE;')
     script.append('DROP TABLE IF EXISTS SCORE_PROTEIN;')
 
     # create the tables
+    if inter_present:
+        script.append('CREATE TABLE SCORE_INTER (FEATURE_ID INTEGER, PVALUE REAL, QVALUE REAL, PEP REAL);')
     if peptide_present:
         script.append('CREATE TABLE SCORE_PEPTIDE (CONTEXT TEXT, RUN_ID INTEGER, PEPTIDE_ID INTEGER, SCORE REAL, PVALUE REAL, QVALUE REAL, PEP REAL);')
     if protein_present:
@@ -638,6 +816,8 @@ def backpropagate_oswr(infile, outfile, apply_scores):
     # copy across the tables
     script.append('ATTACH DATABASE "{}" AS sdb;'.format(apply_scores))
     insert_table_fmt = 'INSERT INTO {0}\nSELECT *\nFROM sdb.{0};'
+    if inter_present:
+        script.append(insert_table_fmt.format('SCORE_INTER'))
     if peptide_present:
         script.append(insert_table_fmt.format('SCORE_PEPTIDE'))
     if protein_present:
