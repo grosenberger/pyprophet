@@ -200,19 +200,11 @@ ORDER BY SCORE DESC
 
 def infer_inter(infile, outfile, parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps):
 
-    def rank_rt(x):
-        y = x['delta_rt'].values
-        center = np.argmin(np.abs(y))
-        ranks = rankdata(y, method='ordinal')
-
-        x['rank_rt'] = ranks - ranks[center]
-
-        return(x[['feature_id','rank_rt']])
-
     con = sqlite3.connect(infile)
 
     if not check_sqlite_table(con, "SCORE_MS2"):
         raise click.ClickException("Apply scoring to MS2-level data before running peptide-level scoring.")
+    ipf_present = check_sqlite_table(con, "SCORE_IPF")
 
     con.executescript('''
 CREATE INDEX IF NOT EXISTS idx_peptide_peptide_id ON PEPTIDE (ID);
@@ -224,7 +216,42 @@ CREATE INDEX IF NOT EXISTS idx_feature_feature_id ON FEATURE (ID);
 CREATE INDEX IF NOT EXISTS idx_score_ms2_feature_id ON SCORE_MS2 (FEATURE_ID);
 ''')
 
-    data = pd.read_sql_query('''
+    if ipf_present:
+        click.echo("Info: Using IPF scores.")
+        data = pd.read_sql_query('''
+SELECT RUN_ID AS RUN_ID,
+   SCORE_IPF.PEPTIDE_ID || '_' || PRECURSOR.ID AS PRECURSOR_ID,
+   FEATURE.ID AS FEATURE_ID,
+   SCORE_IPF.PEPTIDE_ID AS PEPTIDE_ID,
+   FEATURE.DELTA_RT AS DELTA_RT,
+   PEPTIDE.UNMODIFIED_SEQUENCE AS UNMODIFIED_SEQUENCE,
+   PRECURSOR.DECOY,
+   SCORE_IPF.PEP
+FROM PEPTIDE
+INNER JOIN SCORE_IPF ON PEPTIDE.ID = SCORE_IPF.PEPTIDE_ID
+INNER JOIN FEATURE ON SCORE_IPF.FEATURE_ID = FEATURE.ID
+INNER JOIN PRECURSOR ON FEATURE.PRECURSOR_ID = PRECURSOR.ID
+INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
+WHERE SCORE_MS2.RANK == 1 AND PRECURSOR.DECOY == 0
+UNION
+SELECT RUN_ID AS RUN_ID,
+   PRECURSOR.ID AS PRECURSOR_ID,
+   FEATURE.ID AS FEATURE_ID,
+   PEPTIDE.ID AS PEPTIDE_ID,
+   FEATURE.DELTA_RT AS DELTA_RT,
+   PEPTIDE.UNMODIFIED_SEQUENCE AS UNMODIFIED_SEQUENCE,
+   PRECURSOR.DECOY,
+   PEP
+FROM PEPTIDE
+INNER JOIN PRECURSOR_PEPTIDE_MAPPING ON PEPTIDE.ID = PRECURSOR_PEPTIDE_MAPPING.PEPTIDE_ID
+INNER JOIN PRECURSOR ON PRECURSOR_PEPTIDE_MAPPING.PRECURSOR_ID = PRECURSOR.ID
+INNER JOIN FEATURE ON PRECURSOR.ID = FEATURE.PRECURSOR_ID
+INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
+WHERE SCORE_MS2.RANK == 1 AND PRECURSOR.DECOY == 1
+''', con)
+
+    else:
+        data = pd.read_sql_query('''
 SELECT RUN_ID AS RUN_ID,
    PRECURSOR.ID AS PRECURSOR_ID,
    FEATURE.ID AS FEATURE_ID,
@@ -519,6 +546,7 @@ def reduce_osw(infile, outfile):
     conn = sqlite3.connect(infile)
     if not check_sqlite_table(conn, "SCORE_MS2"):
         raise click.ClickException("Apply scoring to MS2 data before reducing file for multi-run scoring.")
+    ipf_present = check_sqlite_table(conn, "SCORE_IPF")
     conn.close()
 
     try:
@@ -529,7 +557,7 @@ def reduce_osw(infile, outfile):
     conn = sqlite3.connect(outfile)
     c = conn.cursor()
 
-    c.executescript('''
+    query = '''
 PRAGMA synchronous = OFF;
 
 ATTACH DATABASE "%s" AS sdb;
@@ -565,7 +593,20 @@ FROM sdb.FEATURE
 WHERE ID IN
     (SELECT FEATURE_ID
      FROM SCORE_MS2);
-''' % infile)
+''' % infile
+
+    if ipf_present:
+        query += '''
+CREATE TABLE SCORE_IPF(FEATURE_ID INTEGER, PEPTIDE_ID INTEGER, PEP REAL);
+
+INSERT INTO SCORE_IPF (FEATURE_ID, PEPTIDE_ID, PEP)
+SELECT FEATURE_ID,
+       PEPTIDE_ID,
+       PEP
+FROM sdb.SCORE_IPF;
+'''
+
+    c.executescript(query)
 
     conn.commit()
     conn.close()
@@ -755,6 +796,8 @@ CREATE TABLE FEATURE(ID INT PRIMARY KEY NOT NULL,
                      RUN_ID INT NOT NULL,
                      PRECURSOR_ID INT NOT NULL,
                      DELTA_RT DOUBLE NOT NULL);
+
+CREATE TABLE SCORE_IPF(FEATURE_ID INTEGER, PEPTIDE_ID INTEGER, PEP REAL);
 ''')
 
     for infile in infiles:
@@ -777,6 +820,21 @@ CREATE TABLE FEATURE(ID INT PRIMARY KEY NOT NULL,
     for infile in infiles:
         c.executescript('ATTACH DATABASE "%s" AS sdb; INSERT INTO SCORE_MS2 SELECT * FROM sdb.SCORE_MS2; DETACH DATABASE sdb;' % infile)
         click.echo("Info: Merged MS2 scores of file %s to %s." % (infile, outfile))
+
+    for infile in infiles:
+        conn2 = sqlite3.connect(infile)
+        ipf_present = check_sqlite_table(conn2, "SCORE_IPF")
+        conn2.close()
+
+        if ipf_present:
+            c.executescript('ATTACH DATABASE "%s" AS sdb; INSERT INTO SCORE_IPF SELECT * FROM sdb.SCORE_IPF; DETACH DATABASE sdb;' % infile)
+            click.echo("Info: Merged IPF scores of file %s to %s." % (infile, outfile))
+
+    # Drop IPF table if empty
+    c.execute('SELECT count(*) FROM SCORE_IPF')
+    if c.fetchone()[0] == 0:
+        c.execute('DROP TABLE SCORE_IPF;')
+    c.fetchall()
 
     conn.commit()
     conn.close()
