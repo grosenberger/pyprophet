@@ -207,13 +207,12 @@ def infer_inter(infile, outfile, parametric, pfdr, pi0_lambda, pi0_method, pi0_s
     ipf_present = check_sqlite_table(con, "SCORE_IPF")
 
     con.executescript('''
-CREATE INDEX IF NOT EXISTS idx_peptide_peptide_id ON PEPTIDE (ID);
-CREATE INDEX IF NOT EXISTS idx_precursor_peptide_mapping_peptide_id ON PRECURSOR_PEPTIDE_MAPPING (PEPTIDE_ID);
-CREATE INDEX IF NOT EXISTS idx_precursor_peptide_mapping_precursor_id ON PRECURSOR_PEPTIDE_MAPPING (PRECURSOR_ID);
 CREATE INDEX IF NOT EXISTS idx_precursor_precursor_id ON PRECURSOR (ID);
 CREATE INDEX IF NOT EXISTS idx_feature_precursor_id ON FEATURE (PRECURSOR_ID);
 CREATE INDEX IF NOT EXISTS idx_feature_feature_id ON FEATURE (ID);
 CREATE INDEX IF NOT EXISTS idx_score_ms2_feature_id ON SCORE_MS2 (FEATURE_ID);
+CREATE INDEX IF NOT EXISTS idx_score_ipf_peptide_id ON SCORE_IPF (PEPTIDE_ID);
+CREATE INDEX IF NOT EXISTS idx_score_ipf_feature_id ON SCORE_IPF (FEATURE_ID);
 ''')
 
     if ipf_present:
@@ -222,13 +221,10 @@ CREATE INDEX IF NOT EXISTS idx_score_ms2_feature_id ON SCORE_MS2 (FEATURE_ID);
 SELECT RUN_ID AS RUN_ID,
    SCORE_IPF.PEPTIDE_ID || '_' || PRECURSOR.ID AS PRECURSOR_ID,
    FEATURE.ID AS FEATURE_ID,
-   SCORE_IPF.PEPTIDE_ID AS PEPTIDE_ID,
    FEATURE.DELTA_RT AS DELTA_RT,
-   PEPTIDE.UNMODIFIED_SEQUENCE AS UNMODIFIED_SEQUENCE,
    PRECURSOR.DECOY,
    SCORE_IPF.PEP
-FROM PEPTIDE
-INNER JOIN SCORE_IPF ON PEPTIDE.ID = SCORE_IPF.PEPTIDE_ID
+FROM SCORE_IPF
 INNER JOIN FEATURE ON SCORE_IPF.FEATURE_ID = FEATURE.ID
 INNER JOIN PRECURSOR ON FEATURE.PRECURSOR_ID = PRECURSOR.ID
 INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
@@ -237,14 +233,10 @@ UNION
 SELECT RUN_ID AS RUN_ID,
    PRECURSOR.ID AS PRECURSOR_ID,
    FEATURE.ID AS FEATURE_ID,
-   PEPTIDE.ID AS PEPTIDE_ID,
    FEATURE.DELTA_RT AS DELTA_RT,
-   PEPTIDE.UNMODIFIED_SEQUENCE AS UNMODIFIED_SEQUENCE,
    PRECURSOR.DECOY,
    PEP
-FROM PEPTIDE
-INNER JOIN PRECURSOR_PEPTIDE_MAPPING ON PEPTIDE.ID = PRECURSOR_PEPTIDE_MAPPING.PEPTIDE_ID
-INNER JOIN PRECURSOR ON PRECURSOR_PEPTIDE_MAPPING.PRECURSOR_ID = PRECURSOR.ID
+FROM PRECURSOR
 INNER JOIN FEATURE ON PRECURSOR.ID = FEATURE.PRECURSOR_ID
 INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
 WHERE SCORE_MS2.RANK == 1 AND PRECURSOR.DECOY == 1
@@ -255,14 +247,10 @@ WHERE SCORE_MS2.RANK == 1 AND PRECURSOR.DECOY == 1
 SELECT RUN_ID AS RUN_ID,
    PRECURSOR.ID AS PRECURSOR_ID,
    FEATURE.ID AS FEATURE_ID,
-   PEPTIDE.ID AS PEPTIDE_ID,
    FEATURE.DELTA_RT AS DELTA_RT,
-   PEPTIDE.UNMODIFIED_SEQUENCE AS UNMODIFIED_SEQUENCE,
    PRECURSOR.DECOY,
    PEP
-FROM PEPTIDE
-INNER JOIN PRECURSOR_PEPTIDE_MAPPING ON PEPTIDE.ID = PRECURSOR_PEPTIDE_MAPPING.PEPTIDE_ID
-INNER JOIN PRECURSOR ON PRECURSOR_PEPTIDE_MAPPING.PRECURSOR_ID = PRECURSOR.ID
+FROM PRECURSOR
 INNER JOIN FEATURE ON PRECURSOR.ID = FEATURE.PRECURSOR_ID
 INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
 WHERE SCORE_MS2.RANK == 1
@@ -271,6 +259,9 @@ ORDER BY SCORE DESC
 
     data.columns = [col.lower() for col in data.columns]
     con.close()
+
+    # Select best scoring peptidoform per feature
+    data = data.loc[data.groupby(['feature_id'])['pep'].idxmin()]
 
     # Compute inter-experiment alignment scores
     click.echo("Info: Compute Inter-Experiment Alignment (IEA) scores.")
@@ -287,11 +278,11 @@ ORDER BY SCORE DESC
     iea['rank_rt'] = iea['iearank'] - iea['ieacenter']
 
     # Compute IEA sum per precursor_id & rank_rt
-    ieasum = iea.groupby(['precursor_id','rank_rt'])['pep'].apply(lambda x: sum((1-x)-0.5)).reset_index(name='ieasum')
+    ieasum = iea.groupby(['precursor_id','rank_rt'])['pep'].apply(lambda x: sum(1-x)).reset_index(name='ieasum')
     iea = iea.merge(ieasum, on=['precursor_id','rank_rt'])
 
     # Compute IEA score per peak group
-    iea['iea'] = iea.apply(lambda x: x['ieasum']-((1-x['pep'])-0.5), axis=1)
+    iea['iea'] = iea.apply(lambda x: x['ieasum']-(1-x['pep']), axis=1)
 
     iea.loc[iea['iea'] > 15]['iea'] = 15
     iea.loc[iea['iea'] < -15]['iea'] = -15
@@ -310,56 +301,13 @@ ORDER BY SCORE DESC
     # Reduce IEA scores
     iea = iea[['feature_id','iea_pep']]
 
-    # Compute sibling ion scores
-    click.echo("Info: Compute Number of Sibling Ion (NSI) scores.")
-
-    nsisum = data.groupby(['run_id','peptide_id'])['pep'].apply(lambda x: sum(1.0-x)).reset_index(name='nsisum')
-
-    nsi = data.merge(nsisum, on=['run_id','peptide_id'])
-    nsi['nsi'] = nsi['nsisum'] - (1.0-nsi['pep'])
-
-    # Compute posterior error probabilities from NSI scores
-    nsi_error_stat, nsi_pi0 = error_statistics(nsi[nsi.decoy==0]['nsi'], nsi[nsi.decoy==1]['nsi'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
-    nsi_p_values, _, nsi_peps, _ = lookup_values_from_error_table(nsi["nsi"].values, nsi_error_stat)
-    nsi_stat_table = final_err_table(nsi_error_stat)
-
-    nsi["nsi_p_value"] = nsi_p_values
-    nsi["nsi_pep"] = nsi_peps
-
-    # export NSI PDF report
-    save_report(outfile + "_" + "inter_nsi" + ".pdf", outfile + ": " + "NSI-level error-rate control", nsi[nsi.decoy==1]["nsi"], nsi[nsi.decoy==0]["nsi"], nsi_stat_table["cutoff"], nsi_stat_table["svalue"], nsi_stat_table["qvalue"], nsi[nsi.decoy==0]["nsi_p_value"], nsi_pi0)
-
-    # Reduce NSI scores
-    nsi = nsi[['feature_id','nsi_pep']]
-
-    # Compute sibling modifications scores
-    click.echo("Info: Compute Number of Sibling Modifications (NSM) scores.")
-
-    nsmsum = data.groupby(['run_id','unmodified_sequence'])['pep'].apply(lambda x: sum(1.0-x)).reset_index(name='nsmsum')
-
-    nsm = data.merge(nsmsum, on=['run_id','unmodified_sequence'])
-    nsm['nsm'] = nsm['nsmsum'] - (1.0-nsm['pep'])
-
-    # Compute posterior error probabilities from NSM scores
-    nsm_error_stat, nsm_pi0 = error_statistics(nsm[nsm.decoy==0]['nsm'], nsm[nsm.decoy==1]['nsm'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
-    nsm_p_values, _, nsm_peps, _ = lookup_values_from_error_table(nsm["nsm"].values, nsm_error_stat)
-    nsm_stat_table = final_err_table(nsm_error_stat)
-
-    nsm["nsm_p_value"] = nsm_p_values
-    nsm["nsm_pep"] = nsm_peps
-
-    # export NSM PDF report
-    save_report(outfile + "_" + "inter_nsm" + ".pdf", outfile + ": " + "NSM-level error-rate control", nsm[nsm.decoy==1]["nsm"], nsm[nsm.decoy==0]["nsm"], nsm_stat_table["cutoff"], nsm_stat_table["svalue"], nsm_stat_table["qvalue"], nsm[nsm.decoy==0]["nsm_p_value"], nsm_pi0)
-
-    # Reduce NSM scores
-    nsm = nsm[['feature_id','nsm_pep']]
-
     # Compute inter analyte & experiment probabilities
     click.echo("Info: Compute inter analyte & experiment probabilities.")
-    inter = data.merge(iea, on='feature_id').merge(nsi, on='feature_id').merge(nsm, on='feature_id')
+    inter = data.merge(iea, on='feature_id')
 
     # Bayesian integration
-    inter['inter'] = (((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) / ((((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) + ((inter['iea_pep']*inter['nsi_pep']*inter['nsm_pep']) * inter['pep']))
+    # inter['inter'] = (((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) / ((((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) + ((inter['iea_pep']*inter['nsi_pep']*inter['nsm_pep']) * inter['pep']))
+    inter['inter'] = ((1-inter['iea_pep']) * (1-inter['pep'])) / (((1-inter['iea_pep']) * (1-inter['pep'])) + (inter['iea_pep'] * inter['pep']))
 
     # Compute posterior error probabilities from inter scores
     inter_error_stat, inter_pi0 = error_statistics(inter[inter.decoy==0]['inter'], inter[inter.decoy==1]['inter'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
