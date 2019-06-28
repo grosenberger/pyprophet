@@ -7,6 +7,7 @@ import sqlite3
 
 from scipy.stats import rankdata
 from .stats import error_statistics, lookup_values_from_error_table, final_err_table, summary_err_table
+from .ipf import compute_model_fdr
 from .report import save_report
 from shutil import copyfile
 from .data_handling import check_sqlite_table
@@ -203,7 +204,7 @@ def infer_inter(infile, outfile, parametric, pfdr, pi0_lambda, pi0_method, pi0_s
     con = sqlite3.connect(infile)
 
     if not check_sqlite_table(con, "SCORE_MS2"):
-        raise click.ClickException("Apply scoring to MS2-level data before running peptide-level scoring.")
+        raise click.ClickException("Apply scoring to MS2-level data before running inter-level scoring.")
     ipf_present = check_sqlite_table(con, "SCORE_IPF")
 
     con.executescript('''
@@ -221,6 +222,7 @@ CREATE INDEX IF NOT EXISTS idx_score_ipf_feature_id ON SCORE_IPF (FEATURE_ID);
 SELECT RUN_ID AS RUN_ID,
    SCORE_IPF.PEPTIDE_ID || '_' || PRECURSOR.ID AS PRECURSOR_ID,
    FEATURE.ID AS FEATURE_ID,
+   SCORE_IPF.PEPTIDE_ID AS PEPTIDE_ID,
    FEATURE.DELTA_RT AS DELTA_RT,
    PRECURSOR.DECOY,
    SCORE_IPF.PEP
@@ -233,11 +235,13 @@ UNION
 SELECT RUN_ID AS RUN_ID,
    PRECURSOR.ID AS PRECURSOR_ID,
    FEATURE.ID AS FEATURE_ID,
+   PRECURSOR_PEPTIDE_MAPPING.PEPTIDE_ID AS PEPTIDE_ID,
    FEATURE.DELTA_RT AS DELTA_RT,
    PRECURSOR.DECOY,
    PEP
 FROM PRECURSOR
 INNER JOIN FEATURE ON PRECURSOR.ID = FEATURE.PRECURSOR_ID
+INNER JOIN PRECURSOR_PEPTIDE_MAPPING ON PRECURSOR.ID = PRECURSOR_PEPTIDE_MAPPING.PRECURSOR_ID
 INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
 WHERE SCORE_MS2.RANK == 1 AND PRECURSOR.DECOY == 1
 ''', con)
@@ -247,11 +251,13 @@ WHERE SCORE_MS2.RANK == 1 AND PRECURSOR.DECOY == 1
 SELECT RUN_ID AS RUN_ID,
    PRECURSOR.ID AS PRECURSOR_ID,
    FEATURE.ID AS FEATURE_ID,
+   PRECURSOR_PEPTIDE_MAPPING.PEPTIDE_ID AS PEPTIDE_ID,
    FEATURE.DELTA_RT AS DELTA_RT,
    PRECURSOR.DECOY,
    PEP
 FROM PRECURSOR
 INNER JOIN FEATURE ON PRECURSOR.ID = FEATURE.PRECURSOR_ID
+INNER JOIN PRECURSOR_PEPTIDE_MAPPING ON PRECURSOR.ID = PRECURSOR_PEPTIDE_MAPPING.PRECURSOR_ID
 INNER JOIN SCORE_MS2 ON FEATURE.ID = SCORE_MS2.FEATURE_ID
 WHERE SCORE_MS2.RANK == 1
 ORDER BY SCORE DESC
@@ -299,33 +305,16 @@ ORDER BY SCORE DESC
     save_report(outfile + "_" + "inter_iea" + ".pdf", outfile + ": " + "IEA-level error-rate control", iea[iea.decoy==1]["iea"], iea[iea.decoy==0]["iea"], iea_stat_table["cutoff"], iea_stat_table["svalue"], iea_stat_table["qvalue"], iea[iea.decoy==0]["iea_p_value"], iea_pi0)
 
     # Reduce IEA scores
-    iea = iea[['feature_id','iea_pep']]
+    iea = iea[iea.decoy==0][['feature_id','iea_pep']]
 
     # Compute inter analyte & experiment probabilities
     click.echo("Info: Compute inter analyte & experiment probabilities.")
     inter = data.merge(iea, on='feature_id')
 
     # Bayesian integration
-    # inter['inter'] = (((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) / ((((1-inter['iea_pep'])*(1-inter['nsi_pep'])*(1-inter['nsm_pep'])) * (1-inter['pep'])) + ((inter['iea_pep']*inter['nsi_pep']*inter['nsm_pep']) * inter['pep']))
-    inter['inter'] = ((1-inter['iea_pep']) * (1-inter['pep'])) / (((1-inter['iea_pep']) * (1-inter['pep'])) + (inter['iea_pep'] * inter['pep']))
-
-    # Compute posterior error probabilities from inter scores
-    inter_error_stat, inter_pi0 = error_statistics(inter[inter.decoy==0]['inter'], inter[inter.decoy==1]['inter'], parametric, pfdr, pi0_lambda, pi0_method, pi0_smooth_df, pi0_smooth_log_pi0, True, lfdr_truncate, lfdr_monotone, lfdr_transformation, lfdr_adj, lfdr_eps)
-    inter_p_values, _, inter_peps, inter_q_values = lookup_values_from_error_table(inter["inter"].values, inter_error_stat)
-    inter_stat_table = final_err_table(inter_error_stat)
-    inter_summary_table = summary_err_table(inter_error_stat)
-
-    inter["inter_p_value"] = inter_p_values
-    inter["inter_pep"] = inter_peps
-    inter["inter_q_value"] = inter_q_values
-
-    # print summary table
-    click.echo("=" * 80)
-    click.echo(inter_summary_table)
-    click.echo("=" * 80)
-
-    # export inter PDF report
-    save_report(outfile + "_" + "inter_integrated" + ".pdf", outfile + ": " + "inter-level error-rate control", inter[inter.decoy==1]["inter"], inter[inter.decoy==0]["inter"], inter_stat_table["cutoff"], inter_stat_table["svalue"], inter_stat_table["qvalue"], inter[inter.decoy==0]["inter_p_value"], inter_pi0)
+    inter['inter_pep'] = 1.0 - (((1.0-inter['iea_pep']) * (1.0-inter['pep'])) / (((1.0-inter['iea_pep']) * (1.0-inter['pep'])) + (inter['iea_pep'] * inter['pep'])))
+    inter[['inter_pep']] = inter[['inter_pep']].fillna(1.0)
+    inter["inter_q_value"] = compute_model_fdr(inter['inter_pep'])
 
     # store data in table
     if infile != outfile:
@@ -333,10 +322,10 @@ ORDER BY SCORE DESC
     
     con = sqlite3.connect(outfile)
 
-    df = inter[['feature_id','inter_p_value','inter_q_value','inter_pep']]
-    df.columns = ['FEATURE_ID','PVALUE','QVALUE','PEP']
+    df = inter[['feature_id','peptide_id','iea_pep','inter_q_value','inter_pep']]
+    df.columns = ['FEATURE_ID','PEPTIDE_ID','IEA_PEP','QVALUE','PEP']
     table = "SCORE_INTER"
-    df.to_sql(table, con, index=False, dtype={"FEATURE_ID": "INTEGER"}, if_exists='replace')
+    df.to_sql(table, con, index=False, if_exists='replace')
 
     con.close()
 
@@ -813,7 +802,7 @@ def backpropagate_oswr(infile, outfile, apply_scores):
 
     # create the tables
     if inter_present:
-        script.append('CREATE TABLE SCORE_INTER (FEATURE_ID INTEGER, PVALUE REAL, QVALUE REAL, PEP REAL);')
+        script.append('CREATE TABLE SCORE_INTER (FEATURE_ID INTEGER, PEPTIDE_ID INTEGER, IEA_PEP REAL, QVALUE REAL, PEP REAL);')
     if peptide_present:
         script.append('CREATE TABLE SCORE_PEPTIDE (CONTEXT TEXT, RUN_ID INTEGER, PEPTIDE_ID INTEGER, SCORE REAL, PVALUE REAL, QVALUE REAL, PEP REAL);')
     if protein_present:

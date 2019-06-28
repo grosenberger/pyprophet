@@ -300,11 +300,12 @@ def backpropagate(infile, outfile, apply_scores):
 @click.option('--ipf', default='peptidoform', show_default=True, type=click.Choice(['peptidoform','augmented','disable']), help='[format: matrix/legacy] Should IPF results be reported if present? "peptidoform": Report results on peptidoform-level, "augmented": Augment OpenSWATH results with IPF scores, "disable": Ignore IPF results')
 @click.option('--ipf_max_peptidoform_pep', default=0.4, show_default=True, type=float, help='[format: matrix/legacy] IPF: Filter results to maximum run-specific peptidoform-level PEP.')
 @click.option('--max_rs_peakgroup_qvalue', default=0.05, show_default=True, type=float, help='[format: matrix/legacy] Filter results to maximum run-specific peak group-level q-value.')
+@click.option('--inter/--no-inter', default=True, show_default=True, help='Append inter-level error-rate estimates if available.')
 @click.option('--peptide/--no-peptide', default=True, show_default=True, help='Append peptide-level error-rate estimates if available.')
 @click.option('--max_global_peptide_qvalue', default=0.01, show_default=True, type=float, help='[format: matrix/legacy] Filter results to maximum global peptide-level q-value.')
 @click.option('--protein/--no-protein', default=True, show_default=True, help='Append protein-level error-rate estimates if available.')
 @click.option('--max_global_protein_qvalue', default=0.01, show_default=True, type=float, help='[format: matrix/legacy] Filter results to maximum global protein-level q-value.')
-def export(infile, outfile, format, outcsv, transition_quantification, max_transition_pep, ipf, ipf_max_peptidoform_pep, max_rs_peakgroup_qvalue, peptide, max_global_peptide_qvalue, protein, max_global_protein_qvalue):
+def export(infile, outfile, format, outcsv, transition_quantification, max_transition_pep, ipf, ipf_max_peptidoform_pep, max_rs_peakgroup_qvalue, inter, peptide, max_global_peptide_qvalue, protein, max_global_protein_qvalue):
     """
     Export TSV/CSV tables
     """
@@ -319,7 +320,7 @@ def export(infile, outfile, format, outcsv, transition_quantification, max_trans
         else:
             outfile = outfile
 
-        export_tsv(infile, outfile, format, outcsv, transition_quantification, max_transition_pep, ipf, ipf_max_peptidoform_pep, max_rs_peakgroup_qvalue, peptide, max_global_peptide_qvalue, protein, max_global_protein_qvalue)
+        export_tsv(infile, outfile, format, outcsv, transition_quantification, max_transition_pep, ipf, ipf_max_peptidoform_pep, max_rs_peakgroup_qvalue, inter, peptide, max_global_peptide_qvalue, protein, max_global_protein_qvalue)
 
 
 # Export Compound TSV

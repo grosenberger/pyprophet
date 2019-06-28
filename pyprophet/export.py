@@ -8,7 +8,7 @@ from .data_handling import check_sqlite_table
 from .report import plot_scores
 
 
-def export_tsv(infile, outfile, format, outcsv, transition_quantification, max_transition_pep, ipf, ipf_max_peptidoform_pep, max_rs_peakgroup_qvalue, peptide, max_global_peptide_qvalue, protein, max_global_protein_qvalue):
+def export_tsv(infile, outfile, format, outcsv, transition_quantification, max_transition_pep, ipf, ipf_max_peptidoform_pep, max_rs_peakgroup_qvalue, inter, peptide, max_global_peptide_qvalue, protein, max_global_protein_qvalue):
 
     con = sqlite3.connect(infile)
 
@@ -310,6 +310,25 @@ INNER JOIN PROTEIN ON PEPTIDE_PROTEIN_MAPPING.PROTEIN_ID = PROTEIN.ID
 GROUP BY PEPTIDE_ID;
 ''', con)
     data = pd.merge(data, data_protein, how='inner', on=['id_peptide'])
+
+    # Append inter error-rate control
+    inter_present = False
+    if peptide:
+        inter_present = check_sqlite_table(con, "SCORE_INTER")
+
+    if inter_present and inter:
+        click.echo("Info: Reading inter-level results.")
+        data_inter = pd.read_sql_query('''
+SELECT FEATURE_ID AS id,
+       QVALUE AS m_score_inter,
+       PEP AS inter_pep,
+       IEA_PEP AS iea_pep
+FROM SCORE_INTER
+WHERE FEATURE_ID IN (SELECT DISTINCT ID FROM FEATURE);
+''', con)
+
+        if len(data_inter.index) > 0:
+            data = pd.merge(data, data_inter, how='inner', on=['id'])
 
     # Append peptide error-rate control
     peptide_present = False
