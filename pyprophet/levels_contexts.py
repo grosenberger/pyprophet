@@ -267,6 +267,9 @@ ORDER BY SCORE DESC
     con.close()
 
     # Select best scoring peptidoform per feature
+    # If we don't do this, we might align different peptidoforms.
+    # Removing this line will propagate confidence in a more comprehensive way,
+    # but the unchanged decoy distribution will result in a high pi0 (~1).
     data = data.loc[data.groupby(['feature_id'])['pep'].idxmin()]
 
     # Compute inter-experiment alignment scores
@@ -304,12 +307,13 @@ ORDER BY SCORE DESC
     # export IEA PDF report
     save_report(outfile + "_" + "inter_iea" + ".pdf", outfile + ": " + "IEA-level error-rate control", iea[iea.decoy==1]["iea"], iea[iea.decoy==0]["iea"], iea_stat_table["cutoff"], iea_stat_table["svalue"], iea_stat_table["qvalue"], iea[iea.decoy==0]["iea_p_value"], iea_pi0)
 
-    # Reduce IEA scores
-    iea = iea[iea.decoy==0][['feature_id','iea_pep']]
+    # Reduce IEA scores (maybe we should exclude decoys here?)
+    # iea = iea[iea.decoy==0][['feature_id','precursor_id','iea_pep']]
+    iea = iea[['feature_id','precursor_id','iea_pep']]
 
     # Compute inter analyte & experiment probabilities
     click.echo("Info: Compute inter analyte & experiment probabilities.")
-    inter = data.merge(iea, on='feature_id')
+    inter = data.merge(iea, on=['feature_id','precursor_id'])
 
     # Bayesian integration
     inter['inter_pep'] = 1.0 - (((1.0-inter['iea_pep']) * (1.0-inter['pep'])) / (((1.0-inter['iea_pep']) * (1.0-inter['pep'])) + (inter['iea_pep'] * inter['pep'])))

@@ -51,6 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_feature_feature_id ON FEATURE (ID);
         query = '''
 SELECT RUN.ID AS id_run,
        PEPTIDE.ID AS id_peptide,
+       PEPTIDE_IPF.ID AS id_peptide_ipf,
        PEPTIDE_IPF.MODIFIED_SEQUENCE || '_' || PRECURSOR.ID AS transition_group_id,
        PRECURSOR.DECOY AS decoy,
        RUN.ID AS run_id,
@@ -313,22 +314,28 @@ GROUP BY PEPTIDE_ID;
 
     # Append inter error-rate control
     inter_present = False
-    if peptide:
+    if inter:
         inter_present = check_sqlite_table(con, "SCORE_INTER")
 
     if inter_present and inter:
         click.echo("Info: Reading inter-level results.")
         data_inter = pd.read_sql_query('''
 SELECT FEATURE_ID AS id,
-       QVALUE AS m_score_inter,
+       PEPTIDE_ID AS id_peptide,
+       QVALUE AS m_score,
        PEP AS inter_pep,
        IEA_PEP AS iea_pep
 FROM SCORE_INTER
 WHERE FEATURE_ID IN (SELECT DISTINCT ID FROM FEATURE);
 ''', con)
 
-        if len(data_inter.index) > 0:
-            data = pd.merge(data, data_inter, how='inner', on=['id'])
+        data = data.rename(columns = {'m_score': 'noninter_m_score'})
+
+        if ipf_present and ipf=='peptidoform':
+            data_inter = data_inter.rename(columns = {'id_peptide': 'id_peptide_ipf'})
+            data = pd.merge(data, data_inter, how='inner', on=['id','id_peptide_ipf'])
+        else:
+            data = pd.merge(data, data_inter, how='inner', on=['id','id_peptide'])
 
     # Append peptide error-rate control
     peptide_present = False
