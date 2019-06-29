@@ -207,7 +207,10 @@ def infer_inter(infile, outfile, parametric, pfdr, pi0_lambda, pi0_method, pi0_s
         raise click.ClickException("Apply scoring to MS2-level data before running inter-level scoring.")
     ipf_present = check_sqlite_table(con, "SCORE_IPF")
 
-    con.executescript('''
+    if ipf_present:
+        click.echo("Info: Using IPF scores.")
+
+        con.executescript('''
 CREATE INDEX IF NOT EXISTS idx_precursor_precursor_id ON PRECURSOR (ID);
 CREATE INDEX IF NOT EXISTS idx_feature_precursor_id ON FEATURE (PRECURSOR_ID);
 CREATE INDEX IF NOT EXISTS idx_feature_feature_id ON FEATURE (ID);
@@ -216,8 +219,6 @@ CREATE INDEX IF NOT EXISTS idx_score_ipf_peptide_id ON SCORE_IPF (PEPTIDE_ID);
 CREATE INDEX IF NOT EXISTS idx_score_ipf_feature_id ON SCORE_IPF (FEATURE_ID);
 ''')
 
-    if ipf_present:
-        click.echo("Info: Using IPF scores.")
         data = pd.read_sql_query('''
 SELECT RUN_ID AS RUN_ID,
    SCORE_IPF.PEPTIDE_ID || '_' || PRECURSOR.ID AS PRECURSOR_ID,
@@ -251,6 +252,13 @@ WHERE SCORE_MS2.RANK == 1 AND PRECURSOR.DECOY == 1
 ''', con)
 
     else:
+        con.executescript('''
+CREATE INDEX IF NOT EXISTS idx_precursor_precursor_id ON PRECURSOR (ID);
+CREATE INDEX IF NOT EXISTS idx_feature_precursor_id ON FEATURE (PRECURSOR_ID);
+CREATE INDEX IF NOT EXISTS idx_feature_feature_id ON FEATURE (ID);
+CREATE INDEX IF NOT EXISTS idx_score_ms2_feature_id ON SCORE_MS2 (FEATURE_ID);
+''')
+
         data = pd.read_sql_query('''
 SELECT RUN_ID AS RUN_ID,
    PRECURSOR.ID AS PRECURSOR_ID,
